@@ -93,11 +93,11 @@ class AttioClient:
         }
 
         if arrival:
-            payload["data"]["entry_values"]["arrival_date_58"] = to_attio_date(arrival)
-            payload["data"]["entry_values"]["arrival_day_status"] = get_day_from_iso(arrival)
+            payload["data"]["entry_values"]["arrival_date_58"] = [{"value": to_attio_date(arrival)}]
+            payload["data"]["entry_values"]["arrival_day_status"] = [{"value": get_day_from_iso(arrival)}]
         if departure:
-            payload["data"]["entry_values"]["departure_date_1"] = to_attio_date(departure)
-            payload["data"]["entry_values"]["departure_day_status"] = get_day_from_iso(departure)
+            payload["data"]["entry_values"]["departure_date_1"] = [{"value": to_attio_date(departure)}]
+            payload["data"]["entry_values"]["departure_day_status"] = [{"value": get_day_from_iso(departure)}]
 
         resp = await client.put(url, headers=self.headers, json=payload)
         resp.raise_for_status()
@@ -141,7 +141,7 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     actor_type = event.get("actor", {}).get("type")
     list_id = event.get("id", {}).get("list_id")
     entry_id = event.get("id", {}).get("entry_id")
-    parent_record_id = event.get("parent_record_id")
+    parent_record_id = event.get("id", {}).get("record_id")
 
     if actor_type != "workspace-member" or list_id != EM_LIST_ID:
         logger.info(f"Evento ignorado: Actor={actor_type}, List={list_id}")
