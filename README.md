@@ -1,30 +1,30 @@
 # Fechas Gests EMs
 
-Servicio FastAPI que sincroniza automáticamente las fechas de llegada y salida desde la lista **EM's Menorca** hacia la lista **Guest Management** en [Attio](https://attio.com/). Se ejecuta como un webhook: cuando un miembro del workspace edita una entrada en EM's, las fechas correspondientes se propagan a la persona asociada en Guest Management.
+Servicio FastAPI que sincroniza automáticamente las fechas de llegada y salida desde las listas **EM's Menorca** y **EM's Mexico** hacia la lista **Guest Management** en [Attio](https://attio.com/). Se ejecuta como un webhook: cuando un miembro del workspace edita una entrada en cualquiera de las listas de EM's, las fechas correspondientes se propagan a la persona asociada en Guest Management.
 
 ## ¿Qué problema resuelve?
 
-En Attio mantenemos dos listas relacionadas:
+En Attio mantenemos varias listas relacionadas:
 
-- **EM's Menorca** (`em_s_menorca`) — registros operativos de cada Encuentro de Mentores, incluyendo `arrival_date` y `departure_date` de cada participante.
+- **EM's Menorca** (`em_s_menorca`) y **EM's Mexico** (`em_s_mexico`) — registros operativos de cada Encuentro de Mentores, ambos sobre el objeto `ems`, incluyendo `arrival_date` y `departure_date` de cada participante.
 - **Guest Management** (`guest_management`) — vista centralizada de huéspedes (objeto `people`), donde los responsables de hospitality consultan las fechas.
 
-Mantener ambas listas sincronizadas a mano es propenso a errores. Este servicio escucha cambios en la lista de EM's y replica las fechas (más el día del mes, usado para vistas/agrupaciones rápidas) en la entrada de Guest Management de la persona asociada.
+Mantener estas listas sincronizadas a mano es propenso a errores. Este servicio escucha cambios en cualquiera de las listas de EM's y replica las fechas (más el día del mes, usado para vistas/agrupaciones rápidas) en la entrada de Guest Management de la persona asociada.
 
 ## Flujo
 
 ```
-Attio (EM's Menorca)
+Attio (EM's Menorca | EM's Mexico)
         │
         │  webhook on entry update
         ▼
    POST /webhook
         │
-        ├── Filtro: actor = workspace-member, list = EM's Menorca
+        ├── Filtro: actor = workspace-member, list ∈ EM_LISTS
         │
-        ├── GET  /lists/em_s_menorca/entries/{entry_id}      → arrival, departure
-        ├── GET  /objects/ems/records/{record_id}            → associated_person
-        └── PUT  /lists/guest_management/entries             → upsert por persona
+        ├── GET  /lists/{em_s_menorca|em_s_mexico}/entries/{entry_id}  → arrival, departure
+        ├── GET  /objects/ems/records/{record_id}                     → associated_person
+        └── PUT  /lists/guest_management/entries                      → upsert por persona
                   · arrival_date_58, arrival_day_status
                   · departure_date_1, departure_day_status
 ```
@@ -35,7 +35,7 @@ El procesado se ejecuta en `BackgroundTasks` para devolver `202 accepted` al web
 
 | Método | Ruta       | Descripción                                                                 |
 | ------ | ---------- | --------------------------------------------------------------------------- |
-| POST   | `/webhook` | Recibe el payload de Attio. Ignora eventos que no sean de un workspace-member sobre la lista EM's Menorca. |
+| POST   | `/webhook` | Recibe el payload de Attio. Ignora eventos que no sean de un workspace-member sobre alguna de las listas EM's soportadas (EM_LISTS). |
 
 Respuestas posibles:
 
@@ -61,12 +61,15 @@ ATTIO_TOKEN=tu_token_de_attio_aqui
 
 El token debe tener permisos de lectura sobre:
 - `lists/em_s_menorca/entries`
+- `lists/em_s_mexico/entries`
 - `objects/ems/records`
+- `list_configuration:read` (para leer las opciones existentes de `arrival_day_status`/`departure_day_status`)
 
 Y escritura sobre:
 - `lists/guest_management/entries`
+- `list_configuration:read-write` (para poder crear una nueva opción de día cuando la fecha cae en un día del mes que aún no existe como status)
 
-> El ID de la lista de EM's (`EM_LIST_ID`) está fijado en [main.py](main.py) — si cambias de workspace o de lista, actualízalo allí.
+> Las listas de EM's soportadas (`EM_LISTS`) están fijadas en [main.py](main.py) como un diccionario `list_id -> api_slug`. Para añadir una nueva sede (o si cambias de workspace), añade su entrada ahí.
 
 ## Instalación y ejecución local
 
@@ -97,7 +100,7 @@ En producción, despliega tras un dominio HTTPS estable (Railway, Fly.io, Render
 
 ## Mapeo de campos
 
-| Origen (EM's Menorca)  | Destino (Guest Management) | Transformación                       |
+| Origen (EM's Menorca / EM's Mexico) | Destino (Guest Management) | Transformación                       |
 | ---------------------- | -------------------------- | ------------------------------------ |
 | `arrival_date`         | `arrival_date_58`          | ISO → `YYYY-MM-DD`                   |
 | `arrival_date`         | `arrival_day_status`       | ISO → día del mes (`"1"`–`"31"`)     |
@@ -106,6 +109,8 @@ En producción, despliega tras un dominio HTTPS estable (Railway, Fly.io, Render
 | `associated_person[0]` | `parent_record_id`         | Se resuelve desde el objeto `ems`    |
 
 Si una fecha viene vacía, simplemente no se incluye en el payload (no se sobrescribe).
+
+`arrival_day_status`/`departure_day_status` son campos de tipo **status** en Attio: solo aceptan valores (días del mes) que ya existan como opción predefinida, y la API rechaza cualquier valor nuevo en vez de crearlo. Antes de cada upsert, el servicio comprueba (`GET /lists/guest_management/attributes/{attr}/statuses`) si el día ya existe como opción y, si no, la crea (`POST` al mismo endpoint) antes de escribir el valor. Esto es necesario porque las opciones actuales solo cubren los días usados hasta ahora en Menorca; EM's Mexico probablemente introducirá días nuevos.
 
 ## Estructura
 

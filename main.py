@@ -16,8 +16,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 ATTIO_TOKEN = os.getenv("ATTIO_TOKEN")
-EM_LIST_ID = "142410f3-47fe-4852-b445-6af86afd2e40"
 BASE_URL = "https://api.attio.com/v2"
+
+# Listas de EM's soportadas: list_id -> api_slug de la lista
+EM_LISTS = {
+    "142410f3-47fe-4852-b445-6af86afd2e40": "em_s_menorca",
+    "d8f6c4ed-0d1b-46b5-848b-fa8aea579922": "em_s_mexico",
+}
 
 def get_day_from_iso(date_str: str) -> Optional[str]:
     """Extrae el número del día en una cadena de texto"""
@@ -51,8 +56,8 @@ class AttioClient:
             "Content-Type": "application/json"
             }
 
-    async def get_entry_dates(self, client: httpx.AsyncClient, entry_id: str):
-        url = f"{BASE_URL}/lists/em_s_menorca/entries/{entry_id}"
+    async def get_entry_dates(self, client: httpx.AsyncClient, list_slug: str, entry_id: str):
+        url = f"{BASE_URL}/lists/{list_slug}/entries/{entry_id}"
         resp = await client.get(url, headers=self.headers)
         resp.raise_for_status()
 
@@ -81,6 +86,25 @@ class AttioClient:
         person_list = values.get("associated_person", [{}])
         return person_list[0].get("target_record_id")
 
+    async def ensure_day_status_option(self, client: httpx.AsyncClient, attribute_slug: str, day: Optional[str]):
+        """Los campos arrival_day_status/departure_day_status son de tipo 'status':
+        Attio rechaza valores que no existan ya como opción, no los crea solos.
+        Aquí comprobamos si el día ya existe como opción y, si no, la creamos."""
+        if not day:
+            return
+
+        url = f"{BASE_URL}/lists/guest_management/attributes/{attribute_slug}/statuses"
+        resp = await client.get(url, headers=self.headers)
+        resp.raise_for_status()
+
+        existing_titles = {status.get("title") for status in resp.json().get("data", [])}
+        if day in existing_titles:
+            return
+
+        logger.info(f"Creando opción de status '{day}' en {attribute_slug}")
+        create_resp = await client.post(url, headers=self.headers, json={"data": {"title": day}})
+        create_resp.raise_for_status()
+
     async def upsert_guest_entry(self, client: httpx.AsyncClient, person_id: str, arrival: str, departure: str):
         url = f"{BASE_URL}/lists/guest_management/entries"
         payload = {
@@ -93,11 +117,15 @@ class AttioClient:
         }
 
         if arrival:
+            arrival_day = get_day_from_iso(arrival)
+            await self.ensure_day_status_option(client, "arrival_day_status", arrival_day)
             payload["data"]["entry_values"]["arrival_date_58"] = [{"value": to_attio_date(arrival)}]
-            payload["data"]["entry_values"]["arrival_day_status"] = [{"value": get_day_from_iso(arrival)}]
+            payload["data"]["entry_values"]["arrival_day_status"] = [{"value": arrival_day}]
         if departure:
+            departure_day = get_day_from_iso(departure)
+            await self.ensure_day_status_option(client, "departure_day_status", departure_day)
             payload["data"]["entry_values"]["departure_date_1"] = [{"value": to_attio_date(departure)}]
-            payload["data"]["entry_values"]["departure_day_status"] = [{"value": get_day_from_iso(departure)}]
+            payload["data"]["entry_values"]["departure_day_status"] = [{"value": departure_day}]
 
         resp = await client.put(url, headers=self.headers, json=payload)
         resp.raise_for_status()
@@ -110,10 +138,10 @@ app = FastAPI(title="Fecha de EM's a Guests Management")
 attio = AttioClient(ATTIO_TOKEN)
 
 # 1. Extraemos la lógica en una función separada async
-async def process_webhook(entry_id: str, parent_record_id: str):
+async def process_webhook(list_slug: str, entry_id: str, parent_record_id: str):
     try:
         async with httpx.AsyncClient() as client:
-            arrival, departure = await attio.get_entry_dates(client, entry_id)
+            arrival, departure = await attio.get_entry_dates(client, list_slug, entry_id)
             person_id = await attio.get_associated_person(client, parent_record_id)
 
             if not person_id:
@@ -143,12 +171,13 @@ async def handle_webhook(request: Request, background_tasks: BackgroundTasks):
     entry_id = event.get("id", {}).get("entry_id")
     parent_record_id = event.get("id", {}).get("record_id")
 
-    if actor_type != "workspace-member" or list_id != EM_LIST_ID:
+    list_slug = EM_LISTS.get(list_id)
+    if actor_type != "workspace-member" or list_slug is None:
         logger.info(f"Evento ignorado: Actor={actor_type}, List={list_id}")
         return {"status": "ignored"}
 
     # Registramos la tarea y respondemos inmediatamente
-    background_tasks.add_task(process_webhook, entry_id, parent_record_id)
+    background_tasks.add_task(process_webhook, list_slug, entry_id, parent_record_id)
     return {"status": "accepted"}
 
 if __name__ == "__main__":
