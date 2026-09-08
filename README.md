@@ -1,129 +1,156 @@
-# Fechas Gests EMs
+# Fechas EM's ⇄ Guest Management
 
-Servicio FastAPI que sincroniza automáticamente las fechas de llegada y salida desde las listas **EM's Menorca** y **EM's Mexico** hacia la lista **Guest Management** en [Attio](https://attio.com/). Se ejecuta como un webhook: cuando un miembro del workspace edita una entrada en cualquiera de las listas de EM's, las fechas correspondientes se propagan a la persona asociada en Guest Management.
+Servicio FastAPI que mantiene sincronizadas **en los dos sentidos** las fechas de
+llegada y salida entre la lista de EM's de la edición activa (**EM's Mexico**) y la
+lista **Guest Management** en [Attio](https://attio.com/). Funciona como webhook:
+cuando un miembro del workspace edita una fecha en cualquiera de las dos listas, el
+cambio se propaga a la otra.
 
 ## ¿Qué problema resuelve?
 
-En Attio mantenemos varias listas relacionadas:
+En Attio conviven varias listas relacionadas:
 
-- **EM's Menorca** (`em_s_menorca`) y **EM's Mexico** (`em_s_mexico`) — registros operativos de cada Encuentro de Mentores, ambos sobre el objeto `ems`, incluyendo `arrival_date` y `departure_date` de cada participante.
-- **Guest Management** (`guest_management`) — vista centralizada de huéspedes (objeto `people`), donde los responsables de hospitality consultan las fechas.
+- **EM's Mexico** (`em_s_mexico`) / **EM's Menorca** (`em_s_menorca`) — registros
+  operativos de cada Encuentro de Mentores, sobre el objeto `ems`. Cada entrada
+  tiene `arrival_date` y `departure_date`.
+- **Guest Management** (`guest_management`) — vista de hospitality sobre el objeto
+  `people`, con `arrival_date_58` / `departure_date_1` (y los `*_day_status`, que
+  guardan el día del mes para agrupar).
 
-Mantener estas listas sincronizadas a mano es propenso a errores. Este servicio escucha cambios en cualquiera de las listas de EM's y replica las fechas (más el día del mes, usado para vistas/agrupaciones rápidas) en la entrada de Guest Management de la persona asociada.
+Antes la sincronización era solo EM's → Guest Management y estaba rota (el webhook
+no trae el `record_id` del padre, así que todas las llamadas fallaban). Ahora:
+
+- Se lee el `parent_record_id` de la propia entrada, no del evento.
+- La sincronización es **bidireccional**.
+- Solo se escribe cuando la fecha **realmente cambia** (no-op guard).
+
+## El enlace entre listas
+
+La **persona** es la clave de unión:
+
+```
+entrada Guest Management ──parent_record──► PERSONA ◄──associated_person── ems record ──parent_record──► entrada EM's
+                                                                              │
+                                                                      program_3 = ACTIVE_PROGRAM
+```
+
+El campo obligatorio `program_3` del objeto `ems` (opción `"Mexico 2026"`) es el
+desambiguador: una persona puede tener un `ems` de Menorca y otro de Mexico; solo
+se toca el de la edición activa.
 
 ## Flujo
 
 ```
-Attio (EM's Menorca | EM's Mexico)
-        │
-        │  webhook on entry update
+Attio (EM's Mexico  |  Guest Management)
+        │  webhook: list-entry.created / updated
         ▼
    POST /webhook
+        │  Filtro por evento: actor == workspace-member, no 'delete',
+        │  lista ∈ {ACTIVE_EM_LIST, Guest Management}
+        │  (los cambios del propio servicio van con actor api-token → se ignoran → sin bucles)
         │
-        ├── Filtro: actor = workspace-member, list ∈ EM_LISTS
+        ├── Origen EM's ──────────────► Dirección A: sync_em_to_guest
+        │     GET entry → parent ems → associated_person (persona)
+        │     GET entrada GM de la persona → compara → PUT upsert GM
+        │       · arrival_date_58 / departure_date_1
+        │       · arrival_day_status / departure_day_status (crea la opción de día si falta)
         │
-        ├── GET  /lists/{em_s_menorca|em_s_mexico}/entries/{entry_id}  → arrival, departure
-        ├── GET  /objects/ems/records/{record_id}                     → associated_person
-        └── PUT  /lists/guest_management/entries                      → upsert por persona
-                  · arrival_date_58, arrival_day_status
-                  · departure_date_1, departure_day_status
+        └── Origen Guest Management ──► Dirección B: sync_guest_to_em
+              GET entry → persona + fechas
+              query ems (associated_person = persona AND program_3 = ACTIVE_PROGRAM)
+              query entrada de ACTIVE_EM_LIST por parent_record_id
+              compara → PATCH entrada EM's (arrival_date / departure_date)
+              + recalcula arrival_day_status / departure_day_status en la propia entrada GM
 ```
 
-El procesado se ejecuta en `BackgroundTasks` para devolver `202 accepted` al webhook inmediatamente y evitar reintentos por timeout.
-
-## Endpoints
-
-| Método | Ruta       | Descripción                                                                 |
-| ------ | ---------- | --------------------------------------------------------------------------- |
-| POST   | `/webhook` | Recibe el payload de Attio. Ignora eventos que no sean de un workspace-member sobre alguna de las listas EM's soportadas (EM_LISTS). |
-
-Respuestas posibles:
-
-- `{"status": "no events"}` — payload sin eventos.
-- `{"status": "ignored"}` — evento fuera del scope (otro actor u otra lista).
-- `{"status": "accepted"}` — evento aceptado; la sincronización corre en background.
-
-## Stack
-
-- **Python 3.10+**
-- [FastAPI](https://fastapi.tiangolo.com/) — servidor HTTP asíncrono
-- [httpx](https://www.python-httpx.org/) — cliente HTTP async hacia la API de Attio
-- [Uvicorn](https://www.uvicorn.org/) — ASGI server
-- [python-dotenv](https://pypi.org/project/python-dotenv/) — carga de variables de entorno
+Todo el procesado corre en `BackgroundTasks`: el webhook responde
+`{"status": "accepted"}` de inmediato y evita reintentos por timeout.
 
 ## Configuración
 
-Crea un archivo `.env` en la raíz del proyecto:
+`.env` en la raíz:
 
 ```env
 ATTIO_TOKEN=tu_token_de_attio_aqui
+# Opcionales (valores por defecto entre paréntesis):
+ACTIVE_PROGRAM=Mexico 2026        # valor de program_3 en el objeto ems
+ACTIVE_EM_LIST=em_s_mexico        # api_slug de la lista de EM's de esa edición
 ```
 
-El token debe tener permisos de lectura sobre:
-- `lists/em_s_menorca/entries`
-- `lists/em_s_mexico/entries`
-- `objects/ems/records`
-- `list_configuration:read` (para leer las opciones existentes de `arrival_day_status`/`departure_day_status`)
+**Al cambiar de sede** (p. ej. Menorca 2027): actualiza `ACTIVE_PROGRAM` y
+`ACTIVE_EM_LIST`. Nada más.
 
-Y escritura sobre:
-- `lists/guest_management/entries`
-- `list_configuration:read-write` (para poder crear una nueva opción de día cuando la fecha cae en un día del mes que aún no existe como status)
+El token necesita:
+- lectura: `lists/{em_s_mexico,guest_management}/entries`, `objects/ems/records`,
+  `list_configuration:read`
+- escritura: `lists/{em_s_mexico,guest_management}/entries`,
+  `list_configuration:read-write` (para crear la opción de día que falte en los
+  campos `*_day_status`)
 
-> Las listas de EM's soportadas (`EM_LISTS`) están fijadas en [main.py](main.py) como un diccionario `list_id -> api_slug`. Para añadir una nueva sede (o si cambias de workspace), añade su entrada ahí.
+## Webhook en Attio
+
+Registrar `https://<dominio>/webhook` para los eventos
+`list-entry.created` y `list-entry.updated` de **EM's Mexico** y **Guest
+Management**. El servicio filtra por su cuenta, así que si el webhook manda más
+listas no pasa nada (se ignoran).
+
+## Mapeo de campos
+
+| EM's (`em_s_mexico`) | Guest Management        | Transformación                  |
+| -------------------- | ---------------------- | ------------------------------- |
+| `arrival_date`       | `arrival_date_58`      | ISO → `YYYY-MM-DD`              |
+| `departure_date`     | `departure_date_1`     | ISO → `YYYY-MM-DD`              |
+| `arrival_date`       | `arrival_day_status`   | ISO → día del mes (`"1"`–`"31"`) |
+| `departure_date`     | `departure_day_status` | ISO → día del mes (`"1"`–`"31"`) |
+
+- Fecha vacía en el origen → no se incluye (no se sobrescribe la del destino).
+- `*_day_status` son de tipo **status**: solo existen en Guest Management y solo en
+  ese sentido. Si el día no existe como opción, el servicio la crea antes de
+  escribir; si Attio rechaza crearla, se omite el día pero la fecha sí se escribe.
+
+## Reglas de la dirección Guest Management → EM's
+
+- Solo se actualiza el `ems` cuyo `program_3` == `ACTIVE_PROGRAM`.
+- Solo se actualizan entradas de EM's **que ya existen** en `ACTIVE_EM_LIST` (no
+  todo el mundo en Guest Management es EM; no se crean entradas nuevas).
+- Si hay varios `ems` de la persona en la edición activa, se actualizan todas sus
+  entradas presentes en la lista.
 
 ## Instalación y ejecución local
 
 ```bash
-# 1. Crear entorno virtual
 python -m venv venv
-source venv/bin/activate          # macOS / Linux
-# .\venv\Scripts\activate         # Windows
-
-# 2. Instalar dependencias
+.\venv\Scripts\activate          # Windows
+# source venv/bin/activate       # macOS / Linux
 pip install -r requirements.txt
-
-# 3. Configurar .env (ver sección anterior)
-
-# 4. Arrancar el servicio
-python main.py
-# o, equivalentemente:
-uvicorn main:app --host 0.0.0.0 --port 8000
+# configurar .env
+python main.py                   # o: uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-El servicio queda escuchando en `http://0.0.0.0:8000`.
-
-## Exponer el webhook a Attio
-
-En desarrollo, expón el puerto 8000 con [ngrok](https://ngrok.com/) o similar y registra la URL pública (`https://<algo>.ngrok.io/webhook`) en la configuración de webhooks de Attio para la lista EM's Menorca.
-
-En producción, despliega tras un dominio HTTPS estable (Railway, Fly.io, Render, etc.) y registra esa URL.
-
-## Mapeo de campos
-
-| Origen (EM's Menorca / EM's Mexico) | Destino (Guest Management) | Transformación                       |
-| ---------------------- | -------------------------- | ------------------------------------ |
-| `arrival_date`         | `arrival_date_58`          | ISO → `YYYY-MM-DD`                   |
-| `arrival_date`         | `arrival_day_status`       | ISO → día del mes (`"1"`–`"31"`)     |
-| `departure_date`       | `departure_date_1`         | ISO → `YYYY-MM-DD`                   |
-| `departure_date`       | `departure_day_status`     | ISO → día del mes (`"1"`–`"31"`)     |
-| `associated_person[0]` | `parent_record_id`         | Se resuelve desde el objeto `ems`    |
-
-Si una fecha viene vacía, simplemente no se incluye en el payload (no se sobrescribe).
-
-`arrival_day_status`/`departure_day_status` son campos de tipo **status** en Attio: solo aceptan valores (días del mes) que ya existan como opción predefinida, y la API rechaza cualquier valor nuevo en vez de crearlo. Antes de cada upsert, el servicio comprueba (`GET /lists/guest_management/attributes/{attr}/statuses`) si el día ya existe como opción y, si no, la crea (`POST` al mismo endpoint) antes de escribir el valor. Esto es necesario porque las opciones actuales solo cubren los días usados hasta ahora en Menorca; EM's Mexico probablemente introducirá días nuevos.
+En desarrollo, expón el puerto 8000 con ngrok y registra la URL pública en Attio.
+En producción se despliega en Railway (proyecto *Attio automations*, servicio
+*fechas-gests-ems*).
 
 ## Estructura
 
 ```
 .
-├── main.py            # App FastAPI, cliente Attio y handler del webhook
-├── requirements.txt   # Dependencias mínimas
+├── main.py            # App FastAPI, cliente Attio y las dos direcciones de sync
+├── requirements.txt
 ├── .gitignore
 └── README.md
 ```
 
 ## Notas operativas
 
-- **Logs**: la app usa el logger estándar de Python en nivel `INFO`. Los errores de la API de Attio se registran con el cuerpo de la respuesta para facilitar el diagnóstico.
-- **Idempotencia**: `PUT /lists/guest_management/entries` se comporta como upsert por `parent_record_id` (la persona). Reenviar el mismo evento es seguro.
-- **Errores silenciosos**: como el procesado va en background, los fallos no devuelven `5xx` al webhook — revisa los logs si las fechas no aparecen en Guest Management.
+- **Logs**: logger estándar en `INFO`. Cada sync deja traza de qué persona/entrada
+  y qué fechas se han escrito, o de por qué se ha omitido. Los errores de Attio se
+  registran con el cuerpo de la respuesta.
+- **Anti-bucle**: los eventos cuyo actor no es `workspace-member` se descartan.
+  Como el servicio escribe con un token (actor `api-token`), sus propias
+  escrituras no re-disparan la sincronización.
+- **Idempotencia**: antes de escribir se compara con el valor actual; si coincide,
+  no se hace la llamada.
+- **Errores silenciosos**: el procesado va en background, los fallos no devuelven
+  `5xx` al webhook. Si una fecha no se propaga, revisar los logs de Railway.
+```
