@@ -97,8 +97,14 @@ class AttioClient:
 
     @staticmethod
     def _wrap(values: dict) -> dict:
-        """{'slug': 'x'} -> {'slug': [{'value': 'x'}]} (formato que espera Attio)."""
-        return {slug: [{"value": v}] for slug, v in values.items()}
+        """Da a cada valor el formato que espera Attio en entry_values:
+        - status (arrival_day_status/departure_day_status): el título como string
+        - fecha/texto: [{'value': 'x'}]"""
+        status_slugs = set(GM_DATE_TO_DAY_STATUS.values())
+        out: dict = {}
+        for slug, v in values.items():
+            out[slug] = v if slug in status_slugs else [{"value": v}]
+        return out
 
     # ---------- lecturas -------------------------------------------------
 
@@ -136,13 +142,32 @@ class AttioClient:
                 out.append(rid)
         return out
 
-    async def find_entry_by_parent(self, client: httpx.AsyncClient, list_slug: str, parent_record_id: str) -> Optional[dict]:
+    async def _query_entries_by_path(self, client: httpx.AsyncClient, list_slug: str,
+                                     path: list, constraints: dict) -> list:
+        """Query de entradas de lista filtrando por un atributo del registro padre.
+        Attio no acepta filtrar por `parent_record_id`; hay que usar un filtro 'path'.
+        Devuelve las entradas completas (con entry_values y parent_record_id)."""
         url = f"{BASE_URL}/lists/{list_slug}/entries/query"
-        payload = {"filter": {"parent_record_id": parent_record_id}, "limit": 1}
+        payload = {"filter": {"path": path, "constraints": constraints}, "limit": 50}
         resp = await client.post(url, headers=self.headers, json=payload)
         resp.raise_for_status()
-        data = resp.json().get("data", [])
-        return data[0] if data else None
+        return resp.json().get("data", [])
+
+    async def find_guest_entry_for_person(self, client: httpx.AsyncClient, person_id: str) -> Optional[dict]:
+        entries = await self._query_entries_by_path(
+            client, GUEST_MANAGEMENT_SLUG,
+            [[GUEST_MANAGEMENT_SLUG, "parent_record"], ["people", "record_id"]],
+            {"value": person_id},
+        )
+        return entries[0] if entries else None
+
+    async def find_em_entries_for_person(self, client: httpx.AsyncClient, person_id: str) -> list:
+        """Entradas de ACTIVE_EM_LIST cuyo registro `ems` padre tiene a esa persona en associated_person."""
+        return await self._query_entries_by_path(
+            client, ACTIVE_EM_LIST,
+            [[ACTIVE_EM_LIST, "parent_record"], ["ems", "associated_person"]],
+            {"target_object": "people", "target_record_id": person_id},
+        )
 
     # ---------- escrituras ---------------------------------------------
 
@@ -222,7 +247,7 @@ async def sync_em_to_guest(client: httpx.AsyncClient, list_slug: str, entry_id: 
         logger.warning(f"ems {ems_record_id} sin associated_person; no se sincroniza")
         return
 
-    gm_entry = await attio.find_entry_by_parent(client, GUEST_MANAGEMENT_SLUG, person_id)
+    gm_entry = await attio.find_guest_entry_for_person(client, person_id)
     gm_values = (gm_entry or {}).get("entry_values", {})
 
     # No-op guard: solo escribimos las fechas que realmente cambian.
@@ -262,16 +287,17 @@ async def sync_guest_to_em(client: httpx.AsyncClient, entry_id: str):
             gm_dates[gm_slug] = val
 
     # --- B.1  Guest Management -> entradas de EM's de esa persona en la edición activa
-    ems_ids = await attio.find_active_ems_records(client, person_id)
-    if not ems_ids:
+    active_ems = set(await attio.find_active_ems_records(client, person_id))
+    if not active_ems:
         logger.info(f"Persona {person_id} sin ems en '{ACTIVE_PROGRAM}'; no se sincroniza a EM's")
 
-    for ems_id in ems_ids:
-        em_entry = await attio.find_entry_by_parent(client, ACTIVE_EM_LIST, ems_id)
-        if not em_entry:
-            logger.info(f"ems {ems_id} sin entrada en {ACTIVE_EM_LIST}; se omite")
-            continue
+    em_entries = await attio.find_em_entries_for_person(client, person_id) if active_ems else []
+    # decisión: solo se tocan entradas ya existentes y del programa activo (no se crean)
+    em_entries = [e for e in em_entries if e.get("parent_record_id") in active_ems]
+    if active_ems and not em_entries:
+        logger.info(f"Persona {person_id} sin entrada en {ACTIVE_EM_LIST}; no se crea nada")
 
+    for em_entry in em_entries:
         em_values = em_entry.get("entry_values", {})
         em_entry_id = em_entry.get("id", {}).get("entry_id")
 
